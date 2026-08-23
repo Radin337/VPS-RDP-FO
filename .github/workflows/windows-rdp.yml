@@ -1,82 +1,53 @@
-name: Windows RDP via ngrok
+name: Windows RDP via Tailscale (Persistent)
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'  # هر 6 ساعت یکبار
 
 jobs:
   rdp:
     runs-on: windows-latest
-    timeout-minutes: 999999999999999
-
+    timeout-minutes: 360  # 6 ساعت دقیقا
+    
     steps:
 
       # =====================================================
-      # 1. Enable RDP
+      # 1. Enable Remote Desktop
       # =====================================================
       - name: Enable Remote Desktop
         shell: powershell
         run: |
           Write-Host "Enabling Remote Desktop..."
-
-          Set-ItemProperty `
-            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" `
-            -Value 0
-
-          Set-ItemProperty `
-            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name "UserAuthentication" `
-            -Value 1
-
-          Enable-NetFirewallRule `
-            -DisplayGroup "Remote Desktop"
-
-          Set-Service `
-            -Name "TermService" `
-            -StartupType Automatic
-
-          Start-Service `
-            -Name "TermService"
-
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 1
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-Service -Name "TermService" -StartupType Automatic
+          Start-Service -Name "TermService"
           Write-Host "RDP enabled."
 
       # =====================================================
-      # 2. Create RDP User
+      # 2. Create RDP User (ثابت)
       # =====================================================
       - name: Create RDP User
         shell: powershell
         run: |
           $Username = "CynetAdmin"
           $Password = "Cynet@2026"
-
-          $SecurePassword = ConvertTo-SecureString `
-            $Password `
-            -AsPlainText `
-            -Force
-
-          $ExistingUser = Get-LocalUser `
-            -Name $Username `
-            -ErrorAction SilentlyContinue
-
+          $SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+          $ExistingUser = Get-LocalUser -Name $Username -ErrorAction SilentlyContinue
+          
           if ($ExistingUser) {
-              Write-Host "User already exists."
-              Set-LocalUser `
-                -Name $Username `
-                -Password $SecurePassword
+              Write-Host "User already exists. Keeping same user."
+          } else {
+              Write-Host "Creating new user..."
+              New-LocalUser -Name $Username -Password $SecurePassword -PasswordNeverExpires -AccountNeverExpires
           }
-          else {
-              New-LocalUser `
-                -Name $Username `
-                -Password $SecurePassword `
-                -PasswordNeverExpires `
-                -AccountNeverExpires
-          }
-
-          Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member $Username `
-            -ErrorAction SilentlyContinue
-
+          
+          Add-LocalGroupMember -Group "Administrators" -Member $Username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $Username -ErrorAction SilentlyContinue
+          
+          Write-Host ""
           Write-Host "=========================================="
           Write-Host "RDP USER"
           Write-Host "Username: $Username"
@@ -84,227 +55,165 @@ jobs:
           Write-Host "=========================================="
 
       # =====================================================
-      # 3. Verify RDP
+      # 3. Install Tailscale (اگر نصب نیست)
       # =====================================================
-      - name: Verify RDP
+      - name: Install Tailscale
         shell: powershell
         run: |
-          $Service = Get-Service -Name TermService
-
-          Write-Host "TermService: $($Service.Status)"
-
-          if ($Service.Status -ne "Running") {
-              Start-Service TermService
+          $TS = "C:\Program Files\Tailscale\tailscale.exe"
+          
+          if (!(Test-Path $TS)) {
+              Write-Host "Installing Tailscale..."
+              $Installer = "$env:TEMP\tailscale.msi"
+              Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $Installer
+              Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$Installer`" /quiet /norestart" -Wait
+              Start-Sleep -Seconds 10
+          } else {
+              Write-Host "Tailscale already installed."
           }
-
-          Start-Sleep -Seconds 3
-
-          $Listener = Get-NetTCPConnection `
-            -LocalPort 3389 `
-            -State Listen `
-            -ErrorAction SilentlyContinue
-
-          if ($Listener) {
-              Write-Host "RDP port 3389 is listening."
-          }
-          else {
-              Write-Error "RDP port 3389 is not listening."
-              exit 1
-          }
+          
+          & $TS version
 
       # =====================================================
-      # 4. Install ngrok
+      # 4. Connect Tailscale (IP ثابت)
       # =====================================================
-      - name: Install ngrok
-        shell: powershell
-        run: |
-          $Zip = "$env:TEMP\ngrok.zip"
-          $InstallDir = "$env:ProgramData\ngrok"
-
-          New-Item `
-            -ItemType Directory `
-            -Path $InstallDir `
-            -Force | Out-Null
-
-          Write-Host "Downloading ngrok..."
-
-          Invoke-WebRequest `
-            -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" `
-            -OutFile $Zip
-
-          Expand-Archive `
-            -Path $Zip `
-            -DestinationPath $InstallDir `
-            -Force
-
-          $Ngrok = "$InstallDir\ngrok.exe"
-
-          if (!(Test-Path $Ngrok)) {
-              Write-Error "ngrok.exe was not found."
-              exit 1
-          }
-
-          Write-Host "ngrok installed:"
-          & $Ngrok version
-
-      # =====================================================
-      # 5. Configure ngrok
-      # =====================================================
-      - name: Configure ngrok
+      - name: Connect Tailscale
         shell: powershell
         env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          $Ngrok = "$env:ProgramData\ngrok\ngrok.exe"
-
-          if ([string]::IsNullOrWhiteSpace($env:NGROK_AUTHTOKEN)) {
-              Write-Error "NGROK_AUTHTOKEN secret is missing."
-              exit 1
+          $TS = "C:\Program Files\Tailscale\tailscale.exe"
+          
+          # بررسی اتصال قبلی
+          $ExistingIP = & $TS ip -4
+          
+          if (![string]::IsNullOrWhiteSpace($ExistingIP)) {
+              Write-Host "Already connected with IP: $ExistingIP"
+              $TSIP = $ExistingIP
+          } else {
+              Write-Host "Connecting to Tailscale..."
+              & $TS up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server" --unattended=true
+              Start-Sleep -Seconds 10
+              $TSIP = & $TS ip -4
           }
-
-          & $Ngrok config add-authtoken "$env:NGROK_AUTHTOKEN"
-
-          if ($LASTEXITCODE -ne 0) {
-              Write-Error "Failed to configure ngrok."
-              exit 1
-          }
-
-          Write-Host "ngrok authentication configured."
-
-      # =====================================================
-      # 6. Start ngrok TCP Tunnel
-      # =====================================================
-      - name: Start ngrok RDP Tunnel
-        shell: powershell
-        run: |
-          $Ngrok = "$env:ProgramData\ngrok\ngrok.exe"
-
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "Starting ngrok TCP tunnel..."
-          Write-Host "Target: 127.0.0.1:3389"
-          Write-Host "=============================================="
-          Write-Host ""
-
-          $Process = Start-Process `
-            -FilePath $Ngrok `
-            -ArgumentList "tcp 3389 --log=stdout" `
-            -RedirectStandardOutput "$env:TEMP\ngrok.log" `
-            -RedirectStandardError "$env:TEMP\ngrok-error.log" `
-            -PassThru
-
-          Start-Sleep -Seconds 8
-
-          if ($Process.HasExited) {
-              Write-Host "ngrok exited unexpectedly."
-              Get-Content "$env:TEMP\ngrok-error.log" -ErrorAction SilentlyContinue
-              exit 1
-          }
-
-          Write-Host "ngrok process started."
-
-      # =====================================================
-      # 7. Get ngrok Public Address
-      # =====================================================
-      - name: Show ngrok Address
-        shell: powershell
-        run: |
-          $NgrokApi = "http://127.0.0.1:4040/api/tunnels"
-
-          $Tunnel = $null
-
-          for ($i = 1; $i -le 999999999999999; $i++) {
-
-              try {
-                  $Response = Invoke-RestMethod `
-                    -Uri $NgrokApi `
-                    -Method Get `
-                    -ErrorAction Stop
-
-                  $Tunnel = $Response.tunnels |
-                    Where-Object {
-                        $_.proto -eq "tcp"
-                    } |
-                    Select-Object -First 1
-
-                  if ($Tunnel) {
-                      break
-                  }
-              }
-              catch {
-                  Start-Sleep -Seconds 2
-              }
-
-              Start-Sleep -Seconds 2
-          }
-
-          if (!$Tunnel) {
-              Write-Host ""
-              Write-Host "ngrok log:"
-              Get-Content "$env:TEMP\ngrok.log" -ErrorAction SilentlyContinue
-
-              Write-Host ""
-              Write-Host "ngrok error log:"
-              Get-Content "$env:TEMP\ngrok-error.log" -ErrorAction SilentlyContinue
-
-              Write-Error "Could not obtain ngrok TCP address."
-              exit 1
-          }
-
-          $PublicUrl = $Tunnel.public_url
-
+          
           Write-Host ""
           Write-Host "======================================================"
           Write-Host "              RDP SERVER IS READY"
           Write-Host "======================================================"
           Write-Host ""
-          Write-Host "ngrok address:"
-          Write-Host $PublicUrl -ForegroundColor Green
+          Write-Host "Tailscale IP: $TSIP" -ForegroundColor Green
+          Write-Host "RDP Address: ${TSIP}:3389" -ForegroundColor Green
           Write-Host ""
-          Write-Host "RDP username:"
-          Write-Host "CynetAdmin"
+          Write-Host "Username: CynetAdmin"
+          Write-Host "Password: Cynet@2026"
           Write-Host ""
-          Write-Host "RDP password:"
-          Write-Host "Cynet@2026"
-          Write-Host ""
+          Write-Host "This session will run for 6 hours"
+          Write-Host "Next session will start automatically"
           Write-Host "======================================================"
-          Write-Host ""
-          Write-Host "Use the hostname and port from the ngrok address"
-          Write-Host "in your RDP client."
-          Write-Host ""
 
       # =====================================================
-      # 8. Keep Runner Alive
+      # 5. Keep RDP Alive (6 ساعت)
       # =====================================================
       - name: Keep RDP Alive
         shell: powershell
         run: |
-          for ($i = 1; $i -le 999999999999999; $i++) {
-
-              $NgrokApi = "http://127.0.0.1:4040/api/tunnels"
-
-              try {
-                  $Response = Invoke-RestMethod `
-                    -Uri $NgrokApi `
-                    -Method Get `
-                    -ErrorAction Stop
-
-                  $Tunnel = $Response.tunnels |
-                    Where-Object {
-                        $_.proto -eq "tcp"
-                    } |
-                    Select-Object -First 1
-
-                  if ($Tunnel) {
-                      Write-Host "[$i/999999999999999] RDP online: $($Tunnel.public_url)"
-                  }
-                  else {
-                      Write-Host "[$i/999999999999999] ngrok tunnel not found."
-                  }
+          $TS = "C:\Program Files\Tailscale\tailscale.exe"
+          $StartTime = Get-Date
+          
+          for ($i = 1; $i -le 355; $i++) {  # 5 ساعت و 55 دقیقه
+              $CurrentTime = Get-Date
+              $Elapsed = ($CurrentTime - $StartTime).TotalMinutes
+              $TSIP = & $TS ip -4
+              
+              # هر 10 دقیقه یکبار نمایش بده
+              if ($i % 10 -eq 0) {
+                  Write-Host ""
+                  Write-Host "=========================================="
+                  Write-Host "[$i/355] RDP ONLINE"
+                  Write-Host "Uptime: $([math]::Round($Elapsed, 0)) minutes"
+                  Write-Host "Tailscale IP: $TSIP"
+                  Write-Host "RDP: ${TSIP}:3389"
+                  Write-Host "Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                  Write-Host "=========================================="
               }
-              catch {
-                  Write-Host "[$i/999999999999999] ngrok API unavailable."
+              
+              # وقتی 5 دقیقه مونده، هشدار بده
+              if ($i -eq 350) {
+                  Write-Host ""
+                  Write-Host "⚠️  5 MINUTES REMAINING!" -ForegroundColor Yellow
+                  Write-Host "Next session will start automatically." -ForegroundColor Yellow
+                  Write-Host "Your IP will stay the same: $TSIP" -ForegroundColor Green
+                  Write-Host ""
               }
-
-              Start-Sleep -Seconds 8
+              
+              Start-Sleep -Seconds 60
           }
+          
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "SESSION COMPLETED" -ForegroundColor Cyan
+          Write-Host "Auto-restarting in 5 minutes..." -ForegroundColor Cyan
+          Write-Host "Your IP will remain: $TSIP" -ForegroundColor Green
+          Write-Host "=========================================="
+
+      # =====================================================
+      # 6. ری‌ران خودکار (با حفظ اطلاعات)
+      # =====================================================
+      - name: Auto Restart
+        if: always()
+        shell: powershell
+        run: |
+          Write-Host "Triggering next session..."
+          
+          $headers = @{
+              "Authorization" = "Bearer ${{ secrets.GITHUB_TOKEN }}"
+              "Accept" = "application/vnd.github.v3+json"
+          }
+          
+          $body = @{
+              "ref" = "${{ github.ref_name }}"
+          } | ConvertTo-Json
+          
+          $url = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow }}/dispatches"
+          
+          try {
+              Invoke-RestMethod -Method Post -Uri $url -Headers $headers -Body $body
+              Write-Host "✅ Next session triggered successfully!" -ForegroundColor Green
+          } catch {
+              Write-Host "⚠️  Auto-restart failed: $_" -ForegroundColor Yellow
+              Write-Host "Next session will start via schedule in 6 hours." -ForegroundColor Yellow
+          }
+
+      # =====================================================
+      # 7. نمایش اطلاعات برای کاربر
+      # =====================================================
+      - name: Connection Info
+        if: always()
+        shell: powershell
+        run: |
+          $TS = "C:\Program Files\Tailscale\tailscale.exe"
+          $TSIP = & $TS ip -4
+          
+          Write-Host ""
+          Write-Host "███████████████████████████████████████████████████████████████"
+          Write-Host "█                                                             █"
+          Write-Host "█              🔵 RDP SERVER CONNECTION INFO                 █"
+          Write-Host "█                                                             █"
+          Write-Host "███████████████████████████████████████████████████████████████"
+          Write-Host "█                                                             █"
+          Write-Host "█  📍 Tailscale IP: $TSIP".PadRight(55) + "█"
+          Write-Host "█  🔗 RDP Address:  ${TSIP}:3389".PadRight(55) + "█"
+          Write-Host "█                                                             █"
+          Write-Host "█  👤 Username:     CynetAdmin".PadRight(55) + "█"
+          Write-Host "█  🔑 Password:     Cynet@2026".PadRight(55) + "█"
+          Write-Host "█                                                             █"
+          Write-Host "█  ⏰ Status:       $([string]::Join('', (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))).PadRight(55) + "█"
+          Write-Host "█                                                             █"
+          Write-Host "███████████████████████████████████████████████████████████████"
+          Write-Host ""
+          Write-Host "✅ Server will auto-restart every 6 hours" -ForegroundColor Green
+          Write-Host "✅ Same IP will be maintained" -ForegroundColor Green
+          Write-Host "✅ Same Username & Password" -ForegroundColor Green
+          Write-Host "✅ No data loss between sessions" -ForegroundColor Green
+          Write-Host ""
