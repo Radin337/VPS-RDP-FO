@@ -1,56 +1,314 @@
-name: Windows Cloud RDP
+# ============================================================
+# Windows Server + Tailscale + RDP
+# Persistent / Reconnect after reboot
+# ============================================================
 
-on:
-  workflow_dispatch:
+$ErrorActionPreference = "Stop"
 
-jobs:
-  build:
-    runs-on: windows-latest
-    timeout-minutes: 9999999999999999999999999999999999999
+Write-Host ""
+Write-Host "============================================================"
+Write-Host " Windows Server - Tailscale + RDP Setup"
+Write-Host "============================================================"
+Write-Host ""
 
-    steps:
-      - name: 1. Enable Remote Desktop & Firewall
-        run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+# ------------------------------------------------------------
+# 1. Check Administrator
+# ------------------------------------------------------------
 
-      - name: 2. Create Admin Account
-        run: |
-          $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
-          New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
-          net user runneradmin Cynet@2026
+$CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$Principal = New-Object Security.Principal.WindowsPrincipal($CurrentIdentity)
 
-      - name: 3. Install & Connect Tailscale VPN
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-        run: |
-          # Download and install Tailscale silently
-          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi" 
-          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait 
-           
-          # Connect to Tailscale network 
-          Start-Sleep -Seconds 5 
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server" 
-           
-          Start-Sleep -Seconds 8 
-           
-          # Get Tailscale IP 
-          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4 
-           
-          Write-Host "" 
-          Write-Host "==================================================" -ForegroundColor Green 
-          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan 
-          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow 
-          Write-Host "  Username     : CynetAdmin" -ForegroundColor Yellow 
-          Write-Host "  Password     : Cynet@2026" -ForegroundColor Yellow 
-          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta 
-          Write-Host "==================================================" -ForegroundColor Green 
- 
-      - name: 4. Keep Server Alive (6 Hours) 
-        run: | 
-          for ($i = 1; $i -le 9999999999999999999999999999999999999; $i++) { 
-            Start-Sleep -Seconds 60 
-            Write-Host "[$i/9999999999999999999999999999999999999] Server running..." 
-          }
+if (-not $Principal.IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)) {
+    Write-Host "ERROR: PowerShell must be run as Administrator." -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "[OK] Administrator privileges detected." -ForegroundColor Green
+
+
+# ------------------------------------------------------------
+# 2. Variables
+# ------------------------------------------------------------
+
+$TailscalePath = "C:\Program Files\Tailscale\tailscale.exe"
+$InstallerPath = "$env:TEMP\tailscale.msi"
+
+$Hostname = "windows-server"
+$RdpUsername = "CynetAdmin"
+
+
+# ------------------------------------------------------------
+# 3. Enable RDP
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "[1/7] Enabling Remote Desktop..." -ForegroundColor Cyan
+
+Set-ItemProperty `
+    -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+    -Name "fDenyTSConnections" `
+    -Value 0
+
+# Keep Network Level Authentication enabled
+Set-ItemProperty `
+    -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+    -Name "UserAuthentication" `
+    -Value 1
+
+Enable-NetFirewallRule `
+    -DisplayGroup "Remote Desktop"
+
+Set-Service `
+    -Name "TermService" `
+    -StartupType Automatic
+
+Start-Service `
+    -Name "TermService"
+
+Write-Host "[OK] Remote Desktop enabled." -ForegroundColor Green
+
+
+# ------------------------------------------------------------
+# 4. Create RDP User
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "[2/7] Creating RDP user..." -ForegroundColor Cyan
+
+$ExistingUser = Get-LocalUser `
+    -Name $RdpUsername `
+    -ErrorAction SilentlyContinue
+
+if ($ExistingUser) {
+
+    Write-Host "User '$RdpUsername' already exists." -ForegroundColor Yellow
+
+    $ChangePassword = Read-Host "Change password? (Y/N)"
+
+    if ($ChangePassword -eq "Y") {
+
+        $RdpPassword = Read-Host `
+            "Enter new password" `
+            -AsSecureString
+
+        Set-LocalUser `
+            -Name $RdpUsername `
+            -Password $RdpPassword
+
+        Write-Host "[OK] Password updated." -ForegroundColor Green
+    }
+
+}
+else {
+
+    $RdpPassword = Read-Host `
+        "Enter password for $RdpUsername" `
+        -AsSecureString
+
+    New-LocalUser `
+        -Name $RdpUsername `
+        -Password $RdpPassword `
+        -PasswordNeverExpires `
+        -AccountNeverExpires `
+        -Description "Persistent RDP account"
+
+    Write-Host "[OK] User created." -ForegroundColor Green
+}
+
+# Add to Remote Desktop Users
+Add-LocalGroupMember `
+    -Group "Remote Desktop Users" `
+    -Member $RdpUsername `
+    -ErrorAction SilentlyContinue
+
+Write-Host "[OK] User added to Remote Desktop Users." -ForegroundColor Green
+
+
+# ------------------------------------------------------------
+# 5. Install Tailscale
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "[3/7] Installing Tailscale..." -ForegroundColor Cyan
+
+if (!(Test-Path $TailscalePath)) {
+
+    Write-Host "Downloading Tailscale..."
+
+    Invoke-WebRequest `
+        -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+        -OutFile $InstallerPath
+
+    Write-Host "Installing..."
+
+    $Process = Start-Process `
+        -FilePath "msiexec.exe" `
+        -ArgumentList "/i `"$InstallerPath`" /quiet /norestart" `
+        -Wait `
+        -PassThru
+
+    if ($Process.ExitCode -ne 0) {
+        Write-Host "Tailscale installation failed." -ForegroundColor Red
+        exit 1
+    }
+
+    Start-Sleep -Seconds 10
+}
+else {
+    Write-Host "Tailscale is already installed." -ForegroundColor Yellow
+}
+
+if (!(Test-Path $TailscalePath)) {
+    Write-Host "ERROR: tailscale.exe not found." -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "[OK] Tailscale installed." -ForegroundColor Green
+
+
+# ------------------------------------------------------------
+# 6. Connect Tailscale
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "[4/7] Connecting to Tailscale..." -ForegroundColor Cyan
+
+Write-Host ""
+Write-Host "Enter your Tailscale Auth Key."
+Write-Host "The key will NOT be written to this script."
+Write-Host ""
+
+$AuthKey = Read-Host "Tailscale Auth Key"
+
+if ([string]::IsNullOrWhiteSpace($AuthKey)) {
+    Write-Host "ERROR: Auth Key is empty." -ForegroundColor Red
+    exit 1
+}
+
+Write-Host ""
+Write-Host "Connecting..."
+
+& $TailscalePath up `
+    --authkey="$AuthKey" `
+    --hostname="$Hostname" `
+    --unattended=true
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "ERROR: Tailscale connection failed." -ForegroundColor Red
+    exit 1
+}
+
+Start-Sleep -Seconds 10
+
+Write-Host "[OK] Tailscale connected." -ForegroundColor Green
+
+
+# ------------------------------------------------------------
+# 7. Verify Tailscale Service
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "[5/7] Checking Tailscale service..." -ForegroundColor Cyan
+
+Get-Service |
+    Where-Object {
+        $_.Name -like "*Tailscale*"
+    } |
+    Format-Table Name, Status, StartType
+
+Write-Host ""
+Write-Host "Tailscale status:" -ForegroundColor Cyan
+
+& $TailscalePath status
+
+
+# ------------------------------------------------------------
+# 8. Get Tailscale IP
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "[6/7] Getting Tailscale IPv4..." -ForegroundColor Cyan
+
+$TailscaleIP = & $TailscalePath ip -4
+
+$TailscaleIP = ($TailscaleIP | Select-Object -First 1).Trim()
+
+if ([string]::IsNullOrWhiteSpace($TailscaleIP)) {
+
+    Write-Host ""
+    Write-Host "ERROR: Could not obtain Tailscale IP." -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "[OK] Tailscale IP: $TailscaleIP" -ForegroundColor Green
+
+
+# ------------------------------------------------------------
+# 9. Verify RDP
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "[7/7] Checking RDP..." -ForegroundColor Cyan
+
+$RdpService = Get-Service `
+    -Name "TermService"
+
+Write-Host "TermService: $($RdpService.Status)"
+
+$RdpListener = Get-NetTCPConnection `
+    -LocalPort 3389 `
+    -State Listen `
+    -ErrorAction SilentlyContinue
+
+if ($RdpListener) {
+
+    Write-Host "[OK] RDP port 3389 is listening." `
+        -ForegroundColor Green
+
+}
+else {
+
+    Write-Host "[WARNING] RDP port 3389 is NOT listening." `
+        -ForegroundColor Yellow
+}
+
+
+# ------------------------------------------------------------
+# Final Information
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host ""
+Write-Host "============================================================"
+Write-Host "              RDP SERVER IS READY"
+Write-Host "============================================================"
+Write-Host ""
+Write-Host "Tailscale IP : $TailscaleIP" -ForegroundColor Yellow
+Write-Host "Username     : $RdpUsername" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "RDP address:"
+Write-Host "$TailscaleIP" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Open:"
+Write-Host "Win + R"
+Write-Host "mstsc"
+Write-Host ""
+Write-Host "Then connect to:"
+Write-Host "$TailscaleIP" -ForegroundColor Green
+Write-Host ""
+Write-Host "============================================================"
+Write-Host " Tailscale unattended mode is enabled."
+Write-Host " RDP is enabled."
+Write-Host " RDP service is set to Automatic."
+Write-Host "============================================================"
+Write-Host ""
+
+# Cleanup installer
+if (Test-Path $InstallerPath) {
+    Remove-Item $InstallerPath -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host "Setup completed successfully." -ForegroundColor Green
