@@ -1,314 +1,310 @@
-# ============================================================
-# Windows Server + Tailscale + RDP
-# Persistent / Reconnect after reboot
-# ============================================================
-
-$ErrorActionPreference = "Stop"
-
-Write-Host ""
-Write-Host "============================================================"
-Write-Host " Windows Server - Tailscale + RDP Setup"
-Write-Host "============================================================"
-Write-Host ""
-
-# ------------------------------------------------------------
-# 1. Check Administrator
-# ------------------------------------------------------------
-
-$CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$Principal = New-Object Security.Principal.WindowsPrincipal($CurrentIdentity)
-
-if (-not $Principal.IsInRole(
-    [Security.Principal.WindowsBuiltInRole]::Administrator
-)) {
-    Write-Host "ERROR: PowerShell must be run as Administrator." -ForegroundColor Red
-    exit 1
-}
-
-Write-Host "[OK] Administrator privileges detected." -ForegroundColor Green
-
-
-# ------------------------------------------------------------
-# 2. Variables
-# ------------------------------------------------------------
-
-$TailscalePath = "C:\Program Files\Tailscale\tailscale.exe"
-$InstallerPath = "$env:TEMP\tailscale.msi"
-
-$Hostname = "windows-server"
-$RdpUsername = "CynetAdmin"
-
-
-# ------------------------------------------------------------
-# 3. Enable RDP
-# ------------------------------------------------------------
-
-Write-Host ""
-Write-Host "[1/7] Enabling Remote Desktop..." -ForegroundColor Cyan
-
-Set-ItemProperty `
-    -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-    -Name "fDenyTSConnections" `
-    -Value 0
-
-# Keep Network Level Authentication enabled
-Set-ItemProperty `
-    -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-    -Name "UserAuthentication" `
-    -Value 1
-
-Enable-NetFirewallRule `
-    -DisplayGroup "Remote Desktop"
-
-Set-Service `
-    -Name "TermService" `
-    -StartupType Automatic
-
-Start-Service `
-    -Name "TermService"
-
-Write-Host "[OK] Remote Desktop enabled." -ForegroundColor Green
-
-
-# ------------------------------------------------------------
-# 4. Create RDP User
-# ------------------------------------------------------------
-
-Write-Host ""
-Write-Host "[2/7] Creating RDP user..." -ForegroundColor Cyan
-
-$ExistingUser = Get-LocalUser `
-    -Name $RdpUsername `
-    -ErrorAction SilentlyContinue
-
-if ($ExistingUser) {
-
-    Write-Host "User '$RdpUsername' already exists." -ForegroundColor Yellow
-
-    $ChangePassword = Read-Host "Change password? (Y/N)"
-
-    if ($ChangePassword -eq "Y") {
-
-        $RdpPassword = Read-Host `
-            "Enter new password" `
-            -AsSecureString
-
-        Set-LocalUser `
-            -Name $RdpUsername `
-            -Password $RdpPassword
-
-        Write-Host "[OK] Password updated." -ForegroundColor Green
-    }
-
-}
-else {
-
-    $RdpPassword = Read-Host `
-        "Enter password for $RdpUsername" `
-        -AsSecureString
-
-    New-LocalUser `
-        -Name $RdpUsername `
-        -Password $RdpPassword `
-        -PasswordNeverExpires `
-        -AccountNeverExpires `
-        -Description "Persistent RDP account"
-
-    Write-Host "[OK] User created." -ForegroundColor Green
-}
-
-# Add to Remote Desktop Users
-Add-LocalGroupMember `
-    -Group "Remote Desktop Users" `
-    -Member $RdpUsername `
-    -ErrorAction SilentlyContinue
-
-Write-Host "[OK] User added to Remote Desktop Users." -ForegroundColor Green
-
-
-# ------------------------------------------------------------
-# 5. Install Tailscale
-# ------------------------------------------------------------
-
-Write-Host ""
-Write-Host "[3/7] Installing Tailscale..." -ForegroundColor Cyan
-
-if (!(Test-Path $TailscalePath)) {
-
-    Write-Host "Downloading Tailscale..."
-
-    Invoke-WebRequest `
-        -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
-        -OutFile $InstallerPath
-
-    Write-Host "Installing..."
-
-    $Process = Start-Process `
-        -FilePath "msiexec.exe" `
-        -ArgumentList "/i `"$InstallerPath`" /quiet /norestart" `
-        -Wait `
-        -PassThru
-
-    if ($Process.ExitCode -ne 0) {
-        Write-Host "Tailscale installation failed." -ForegroundColor Red
-        exit 1
-    }
-
-    Start-Sleep -Seconds 10
-}
-else {
-    Write-Host "Tailscale is already installed." -ForegroundColor Yellow
-}
-
-if (!(Test-Path $TailscalePath)) {
-    Write-Host "ERROR: tailscale.exe not found." -ForegroundColor Red
-    exit 1
-}
-
-Write-Host "[OK] Tailscale installed." -ForegroundColor Green
-
-
-# ------------------------------------------------------------
-# 6. Connect Tailscale
-# ------------------------------------------------------------
-
-Write-Host ""
-Write-Host "[4/7] Connecting to Tailscale..." -ForegroundColor Cyan
-
-Write-Host ""
-Write-Host "Enter your Tailscale Auth Key."
-Write-Host "The key will NOT be written to this script."
-Write-Host ""
-
-$AuthKey = Read-Host "Tailscale Auth Key"
-
-if ([string]::IsNullOrWhiteSpace($AuthKey)) {
-    Write-Host "ERROR: Auth Key is empty." -ForegroundColor Red
-    exit 1
-}
-
-Write-Host ""
-Write-Host "Connecting..."
-
-& $TailscalePath up `
-    --authkey="$AuthKey" `
-    --hostname="$Hostname" `
-    --unattended=true
-
-if ($LASTEXITCODE -ne 0) {
-    Write-Host ""
-    Write-Host "ERROR: Tailscale connection failed." -ForegroundColor Red
-    exit 1
-}
-
-Start-Sleep -Seconds 10
-
-Write-Host "[OK] Tailscale connected." -ForegroundColor Green
-
-
-# ------------------------------------------------------------
-# 7. Verify Tailscale Service
-# ------------------------------------------------------------
-
-Write-Host ""
-Write-Host "[5/7] Checking Tailscale service..." -ForegroundColor Cyan
-
-Get-Service |
-    Where-Object {
-        $_.Name -like "*Tailscale*"
-    } |
-    Format-Table Name, Status, StartType
-
-Write-Host ""
-Write-Host "Tailscale status:" -ForegroundColor Cyan
-
-& $TailscalePath status
-
-
-# ------------------------------------------------------------
-# 8. Get Tailscale IP
-# ------------------------------------------------------------
-
-Write-Host ""
-Write-Host "[6/7] Getting Tailscale IPv4..." -ForegroundColor Cyan
-
-$TailscaleIP = & $TailscalePath ip -4
-
-$TailscaleIP = ($TailscaleIP | Select-Object -First 1).Trim()
-
-if ([string]::IsNullOrWhiteSpace($TailscaleIP)) {
-
-    Write-Host ""
-    Write-Host "ERROR: Could not obtain Tailscale IP." -ForegroundColor Red
-    exit 1
-}
-
-Write-Host "[OK] Tailscale IP: $TailscaleIP" -ForegroundColor Green
-
-
-# ------------------------------------------------------------
-# 9. Verify RDP
-# ------------------------------------------------------------
-
-Write-Host ""
-Write-Host "[7/7] Checking RDP..." -ForegroundColor Cyan
-
-$RdpService = Get-Service `
-    -Name "TermService"
-
-Write-Host "TermService: $($RdpService.Status)"
-
-$RdpListener = Get-NetTCPConnection `
-    -LocalPort 3389 `
-    -State Listen `
-    -ErrorAction SilentlyContinue
-
-if ($RdpListener) {
-
-    Write-Host "[OK] RDP port 3389 is listening." `
-        -ForegroundColor Green
-
-}
-else {
-
-    Write-Host "[WARNING] RDP port 3389 is NOT listening." `
-        -ForegroundColor Yellow
-}
-
-
-# ------------------------------------------------------------
-# Final Information
-# ------------------------------------------------------------
-
-Write-Host ""
-Write-Host ""
-Write-Host "============================================================"
-Write-Host "              RDP SERVER IS READY"
-Write-Host "============================================================"
-Write-Host ""
-Write-Host "Tailscale IP : $TailscaleIP" -ForegroundColor Yellow
-Write-Host "Username     : $RdpUsername" -ForegroundColor Yellow
-Write-Host ""
-Write-Host "RDP address:"
-Write-Host "$TailscaleIP" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "Open:"
-Write-Host "Win + R"
-Write-Host "mstsc"
-Write-Host ""
-Write-Host "Then connect to:"
-Write-Host "$TailscaleIP" -ForegroundColor Green
-Write-Host ""
-Write-Host "============================================================"
-Write-Host " Tailscale unattended mode is enabled."
-Write-Host " RDP is enabled."
-Write-Host " RDP service is set to Automatic."
-Write-Host "============================================================"
-Write-Host ""
-
-# Cleanup installer
-if (Test-Path $InstallerPath) {
-    Remove-Item $InstallerPath -Force -ErrorAction SilentlyContinue
-}
-
-Write-Host "Setup completed successfully." -ForegroundColor Green
+name: Windows RDP via ngrok
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 999999999999999
+
+    steps:
+
+      # =====================================================
+      # 1. Enable RDP
+      # =====================================================
+      - name: Enable Remote Desktop
+        shell: powershell
+        run: |
+          Write-Host "Enabling Remote Desktop..."
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1
+
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop"
+
+          Set-Service `
+            -Name "TermService" `
+            -StartupType Automatic
+
+          Start-Service `
+            -Name "TermService"
+
+          Write-Host "RDP enabled."
+
+      # =====================================================
+      # 2. Create RDP User
+      # =====================================================
+      - name: Create RDP User
+        shell: powershell
+        run: |
+          $Username = "CynetAdmin"
+          $Password = "Cynet@2026"
+
+          $SecurePassword = ConvertTo-SecureString `
+            $Password `
+            -AsPlainText `
+            -Force
+
+          $ExistingUser = Get-LocalUser `
+            -Name $Username `
+            -ErrorAction SilentlyContinue
+
+          if ($ExistingUser) {
+              Write-Host "User already exists."
+              Set-LocalUser `
+                -Name $Username `
+                -Password $SecurePassword
+          }
+          else {
+              New-LocalUser `
+                -Name $Username `
+                -Password $SecurePassword `
+                -PasswordNeverExpires `
+                -AccountNeverExpires
+          }
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $Username `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "=========================================="
+          Write-Host "RDP USER"
+          Write-Host "Username: $Username"
+          Write-Host "Password: $Password"
+          Write-Host "=========================================="
+
+      # =====================================================
+      # 3. Verify RDP
+      # =====================================================
+      - name: Verify RDP
+        shell: powershell
+        run: |
+          $Service = Get-Service -Name TermService
+
+          Write-Host "TermService: $($Service.Status)"
+
+          if ($Service.Status -ne "Running") {
+              Start-Service TermService
+          }
+
+          Start-Sleep -Seconds 3
+
+          $Listener = Get-NetTCPConnection `
+            -LocalPort 3389 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if ($Listener) {
+              Write-Host "RDP port 3389 is listening."
+          }
+          else {
+              Write-Error "RDP port 3389 is not listening."
+              exit 1
+          }
+
+      # =====================================================
+      # 4. Install ngrok
+      # =====================================================
+      - name: Install ngrok
+        shell: powershell
+        run: |
+          $Zip = "$env:TEMP\ngrok.zip"
+          $InstallDir = "$env:ProgramData\ngrok"
+
+          New-Item `
+            -ItemType Directory `
+            -Path $InstallDir `
+            -Force | Out-Null
+
+          Write-Host "Downloading ngrok..."
+
+          Invoke-WebRequest `
+            -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" `
+            -OutFile $Zip
+
+          Expand-Archive `
+            -Path $Zip `
+            -DestinationPath $InstallDir `
+            -Force
+
+          $Ngrok = "$InstallDir\ngrok.exe"
+
+          if (!(Test-Path $Ngrok)) {
+              Write-Error "ngrok.exe was not found."
+              exit 1
+          }
+
+          Write-Host "ngrok installed:"
+          & $Ngrok version
+
+      # =====================================================
+      # 5. Configure ngrok
+      # =====================================================
+      - name: Configure ngrok
+        shell: powershell
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          $Ngrok = "$env:ProgramData\ngrok\ngrok.exe"
+
+          if ([string]::IsNullOrWhiteSpace($env:NGROK_AUTHTOKEN)) {
+              Write-Error "NGROK_AUTHTOKEN secret is missing."
+              exit 1
+          }
+
+          & $Ngrok config add-authtoken "$env:NGROK_AUTHTOKEN"
+
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Failed to configure ngrok."
+              exit 1
+          }
+
+          Write-Host "ngrok authentication configured."
+
+      # =====================================================
+      # 6. Start ngrok TCP Tunnel
+      # =====================================================
+      - name: Start ngrok RDP Tunnel
+        shell: powershell
+        run: |
+          $Ngrok = "$env:ProgramData\ngrok\ngrok.exe"
+
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "Starting ngrok TCP tunnel..."
+          Write-Host "Target: 127.0.0.1:3389"
+          Write-Host "=============================================="
+          Write-Host ""
+
+          $Process = Start-Process `
+            -FilePath $Ngrok `
+            -ArgumentList "tcp 3389 --log=stdout" `
+            -RedirectStandardOutput "$env:TEMP\ngrok.log" `
+            -RedirectStandardError "$env:TEMP\ngrok-error.log" `
+            -PassThru
+
+          Start-Sleep -Seconds 8
+
+          if ($Process.HasExited) {
+              Write-Host "ngrok exited unexpectedly."
+              Get-Content "$env:TEMP\ngrok-error.log" -ErrorAction SilentlyContinue
+              exit 1
+          }
+
+          Write-Host "ngrok process started."
+
+      # =====================================================
+      # 7. Get ngrok Public Address
+      # =====================================================
+      - name: Show ngrok Address
+        shell: powershell
+        run: |
+          $NgrokApi = "http://127.0.0.1:4040/api/tunnels"
+
+          $Tunnel = $null
+
+          for ($i = 1; $i -le 999999999999999; $i++) {
+
+              try {
+                  $Response = Invoke-RestMethod `
+                    -Uri $NgrokApi `
+                    -Method Get `
+                    -ErrorAction Stop
+
+                  $Tunnel = $Response.tunnels |
+                    Where-Object {
+                        $_.proto -eq "tcp"
+                    } |
+                    Select-Object -First 1
+
+                  if ($Tunnel) {
+                      break
+                  }
+              }
+              catch {
+                  Start-Sleep -Seconds 2
+              }
+
+              Start-Sleep -Seconds 2
+          }
+
+          if (!$Tunnel) {
+              Write-Host ""
+              Write-Host "ngrok log:"
+              Get-Content "$env:TEMP\ngrok.log" -ErrorAction SilentlyContinue
+
+              Write-Host ""
+              Write-Host "ngrok error log:"
+              Get-Content "$env:TEMP\ngrok-error.log" -ErrorAction SilentlyContinue
+
+              Write-Error "Could not obtain ngrok TCP address."
+              exit 1
+          }
+
+          $PublicUrl = $Tunnel.public_url
+
+          Write-Host ""
+          Write-Host "======================================================"
+          Write-Host "              RDP SERVER IS READY"
+          Write-Host "======================================================"
+          Write-Host ""
+          Write-Host "ngrok address:"
+          Write-Host $PublicUrl -ForegroundColor Green
+          Write-Host ""
+          Write-Host "RDP username:"
+          Write-Host "CynetAdmin"
+          Write-Host ""
+          Write-Host "RDP password:"
+          Write-Host "Cynet@2026"
+          Write-Host ""
+          Write-Host "======================================================"
+          Write-Host ""
+          Write-Host "Use the hostname and port from the ngrok address"
+          Write-Host "in your RDP client."
+          Write-Host ""
+
+      # =====================================================
+      # 8. Keep Runner Alive
+      # =====================================================
+      - name: Keep RDP Alive
+        shell: powershell
+        run: |
+          for ($i = 1; $i -le 999999999999999; $i++) {
+
+              $NgrokApi = "http://127.0.0.1:4040/api/tunnels"
+
+              try {
+                  $Response = Invoke-RestMethod `
+                    -Uri $NgrokApi `
+                    -Method Get `
+                    -ErrorAction Stop
+
+                  $Tunnel = $Response.tunnels |
+                    Where-Object {
+                        $_.proto -eq "tcp"
+                    } |
+                    Select-Object -First 1
+
+                  if ($Tunnel) {
+                      Write-Host "[$i/999999999999999] RDP online: $($Tunnel.public_url)"
+                  }
+                  else {
+                      Write-Host "[$i/999999999999999] ngrok tunnel not found."
+                  }
+              }
+              catch {
+                  Write-Host "[$i/999999999999999] ngrok API unavailable."
+              }
+
+              Start-Sleep -Seconds 8
+          }
